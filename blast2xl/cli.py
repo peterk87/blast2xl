@@ -16,20 +16,28 @@ logger = logging.getLogger(__name__)
 
 
 @click.command()
-@click.option('--blast-tsv-dir', type=click.Path(exists=True), required=True,
+@click.option('-b', '--blast-tsv-dir', type=click.Path(exists=True), required=True,
               help='Input directory with BLAST tab-delimited (TSV) files. The base filename should be the sample '
                    'name. If a `--seq-dir` is provided, the BLAST TSV base filenames should match the FASTA base '
                    'filenames.')
-@click.option('--blast-tsv-sample-name-pattern', type=str, default=None,
+@click.option('-B', '--blast-tsv-sample-name-pattern', type=str, default=None,
               help='Regex pattern to extract sample name from BLAST TSV filename. '
                    'For example "^blastn-(.+)-vs-nt\\.tsv" to match "blastn-whatever-you-want-123-vs-nt.tsv" to '
                    'pull out sample name "whatever-you-want-123"')
-@click.option('--seq-dir', type=click.Path(exists=True),
+@click.option('--blast-tsv-extension', default='tsv', type=str,
+              help='Tabular BLAST filename extension (default: "tsv")')
+@click.option('-s', '--seq-dir', type=click.Path(exists=True),
               help='Input directory with FASTA sequences from BLAST results. The base filename should be the sample '
                    'name and match the base filename for each BLAST result file.')
-@click.option('--top-n-results', default=-1, type=int,
+@click.option('-S', '--seq-fasta-sample-name-pattern', type=str, default=None,
+              help='Regex pattern to extract sample name from sequence FASTA filename. '
+                   'For example "^(.+)-contigs\\.fasta" to match "my_sample1-contigs.fasta" to '
+                   'pull out sample name "my_sample1"')
+@click.option('--seq-fasta-extension', default='fasta', type=str,
+              help='Sample sequence FASTA filename extension (default: "fasta")')
+@click.option('-n', '--top-n-results', default=-1, type=int,
               help='Only take the top N results for each sequence when generating the "All BLAST Results" sheet in '
-                   'the XLSX report.')
+                   'the XLSX report. (default: -1 (all results))')
 @click.option('-o', '--output-xlsx', type=click.Path(),
               required=True,
               help='XLSX output file path')
@@ -42,7 +50,10 @@ logger = logging.getLogger(__name__)
 @click.option('-v', '--verbose', default=0, count=True, help='Logging verbosity')
 def main(blast_tsv_dir,
          blast_tsv_sample_name_pattern,
+         blast_tsv_extension,
          seq_dir,
+         seq_fasta_sample_name_pattern,
+         seq_fasta_extension,
          top_n_results,
          output_xlsx,
          seq_outdir,
@@ -98,15 +109,22 @@ def main(blast_tsv_dir,
 
     if blast_tsv_sample_name_pattern:
         sample_name_regex = re.compile(blast_tsv_sample_name_pattern)
-        logger.debug(f'sample_name_regex={sample_name_regex}')
-        sample_blast_tsv: Dict[str, Path] = {sample_name_regex.sub(r'\1', x.name).replace('.tsv', ''): x for x in blast_tsv_dir.glob('*.tsv')}
+        logger.debug(f'BLAST TSV sample_name_regex={sample_name_regex}')
+        sample_blast_tsv: Dict[str, Path] = {
+            sample_name_regex.sub(r'\1', x.name).replace(f'.{blast_tsv_extension}', ''): x for x in
+            blast_tsv_dir.glob(f'*.{blast_tsv_extension}')}
     else:
-        sample_blast_tsv: Dict[str, Path] = {x.name.replace('.tsv', ''): x for x in blast_tsv_dir.glob('*.tsv')}
-    logger.info(f'Found {len(sample_blast_tsv)} TSV files in "{blast_tsv_dir}"')
+        sample_blast_tsv: Dict[str, Path] = {x.name.replace(f'.{blast_tsv_extension}', ''): x for x in
+                                             blast_tsv_dir.glob(f'*.{blast_tsv_extension}')}
+    logger.info(f'Found {len(sample_blast_tsv)} BLAST tabular result files in "{blast_tsv_dir}"')
     sample_dfs = blast_tsv_to_df(sample_blast_tsv, top_n_results)
     output_xlsx_report(output_xlsx, sample_dfs, top_n_results)
     if seq_dir:
-        fastas, present_fastas = check_fastas(sample_blast_tsv, seq_dir, seq_outdir)
+        fastas, present_fastas = collect_fastas(sample_blast_tsv=sample_blast_tsv,
+                                                seq_dir=seq_dir,
+                                                seq_outdir=seq_outdir,
+                                                sample_name_pattern=seq_fasta_sample_name_pattern,
+                                                fasta_ext=seq_fasta_extension)
         path_seqoutdir = Path(seq_outdir)
         path_seqoutdir.mkdir(parents=True, exist_ok=True)
         write_seqs_to_taxonomy_dirs(fastas,
@@ -116,13 +134,24 @@ def main(blast_tsv_dir,
                                     keep_orientation=keep_orientation)
 
 
-def check_fastas(sample_blast_tsv: Dict[str, Path], seq_dir: str, seq_outdir: str) -> Tuple[Dict[str, Path], Set[str]]:
+def collect_fastas(sample_blast_tsv: Dict[str, Path],
+                   seq_dir: str,
+                   seq_outdir: str,
+                   sample_name_pattern: str = None,
+                   fasta_ext: str = 'fasta') -> Tuple[Dict[str, Path], Set[str]]:
     seq_dir = Path(seq_dir)
     logger.info(f'FASTA sequence directory provided: "{seq_dir}". Taxonomy sorted sequences will be output'
                 f' to "{seq_outdir}".')
-    fastas = {x.name.replace('.fasta', ''): x for x in seq_dir.glob('*.fasta')}
+    if sample_name_pattern:
+        sample_name_regex = re.compile(sample_name_pattern)
+        logger.debug(f'FASTA sample_name_regex={sample_name_regex}')
+        fastas: Dict[str, Path] = {sample_name_regex.sub(r'\1', x.name).replace('.tsv', ''): x for x in
+                                   seq_dir.glob(f'*.{fasta_ext}')}
+    else:
+        fastas = {x.name.replace('.fasta', ''): x for x in seq_dir.glob(f'*.{fasta_ext}')}
     if len(fastas) == 0:
-        logger.warning(f'FASTA sequence directory contains no FASTA files matching glob pattern "*.fasta"!')
+        logger.warning(
+            f'FASTA sequence directory "{seq_dir}" contains no FASTA files matching glob pattern "*.{fasta_ext}"!')
     # check that all BLAST TSV files have an associated FASTA file
     missing_fastas = set(sample_blast_tsv.keys()) - set(fastas.keys())
     if len(missing_fastas) > 0:
